@@ -1,0 +1,196 @@
+---
+title: "Project work"
+author: "Mikko Junttila"
+date: "21 lokakuuta 2017"
+output: html_document
+---
+```{r packages, message = FALSE, warning=FALSE}
+
+library(ggplot2)
+library(caret)
+library(gridExtra)
+library(randomForest)
+library(dplyr)
+library(doParallel)
+library(ParallelForest)
+library(iterators)
+library(foreach)
+
+```
+
+```{r download and read in data, cache=TRUE, message=FALSE}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(train_url, "training.csv")
+download.file(test_url, "testing.csv")
+training <- read.csv("training.csv", header = TRUE, stringsAsFactors = FALSE)
+testing <- read.csv("testing.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+
+Variables that cannot be used as predictors are removed. Only variables that contain actual measurements from the experiments are kept. Variables that are removed have for instance high number of NAs or they have high number of missing observations. Such variables include variables that report for instance average values, variances, standard deviations, minimum or maximum values, skewness, kurtosis and amplitudes of different measurements. Also variables that contain user names, time information and window information are removed. 
+
+```{r variable selection, cache=TRUE}
+
+cols <- c("X", "user_", "amplitude", "window", "avg_", "var_","stddev", "kurtosis", "skewness", "max_", "min_", "timestamp")
+removed_cols <- grep(paste(cols, collapse = "|"), names(training))
+training <- training[,-removed_cols]
+```
+
+
+```{r data slicing, cache=TRUE}
+set.seed(1234)
+inTrain <- createDataPartition(y = training$classe, p = 0.6, list = FALSE)
+traindata <- training[inTrain, ]
+testdata <- training[-inTrain, ]
+```
+
+## Eploratory data analysis
+
+On the left in figure below is shown values of variable total_accel_belt colored with different classes from classe variable. Figure shows clearly that values of variable total_accel_belt for classe E are significantly different from other classes. Classe E has much higher values for variable total_accel_belt. On the right in the figure below is presented values of variable gyros_belt_z colored with different classes from classe variable. Range of values in classes D and E are much wider than the range in other classes.
+
+```{r eda1, fig.height=4, fig.width = 8, cache=TRUE}
+x <- 1:nrow(traindata)
+plot1 <- traindata %>% ggplot(aes(x = x, y = total_accel_belt, col = classe)) + geom_point()
+
+plot2 <- traindata %>% ggplot(aes(x = x, y = gyros_belt_z, col = classe)) + geom_point()
+
+grid.arrange(plot1, plot2, ncol = 2)
+```
+
+
+On the left in figure below is shown values of variable magnet_dumbbell_y. In classe C over 50 percentage of the values are below the lower quantile of other classes. On the right in figure below is shown values of variable pitch_forearm. In classe A range of values of variable pitch_forearm is much wider than in other classes. Also majority of the values in classe A lower than the values in other classes.
+
+```{r eda2, fig.height=4, fig.width = 8, cache=TRUE, message=FALSE, warning=FALSE}
+
+plot3 <- traindata %>% ggplot(aes( y = magnet_dumbbell_y, x = classe)) + geom_boxplot() + ylim(c(-750, 750))
+plot4 <- traindata %>% ggplot(aes( y = pitch_forearm, x = classe)) + geom_boxplot()
+grid.arrange(plot3, plot4, ncol = 2)
+```
+## Model tuning
+
+There are 52 predictors in traindata. Is any of the predictos zerovariance predictor and therefore possible to be removed from the traindata? Analysis of the traindata below shows that there are no zerovariance predictors in traindata. All predictors have more variance than 0.1%.
+
+```{r zerovar, cache=TRUE}
+nsv <- nearZeroVar(traindata[,-53], saveMetrics = TRUE)
+dim(nsv[nsv$percentUnique > 0.1,]) == dim(nsv)
+```
+
+
+Randomforest was chosen as a model for model tuning in order to classify observations in traindata. Performance of different models are compared by their accuracy in predicting classes in testdata.
+
+
+Randomforest model of traindata without any preprocessing of traindata:
+
+```{r rf, cache=TRUE}
+
+set.seed(2343)
+
+model_rf <- randomForest(x = traindata[,-53], y = as.factor(traindata$classe), importance = TRUE)
+
+confusionMatrix(testdata$classe, predict(model_rf, testdata))$overall["Accuracy"]
+
+```
+
+Randomforest model of traindata after decreasing predictors in traindata by using principal component analysis i order to avoid overfitting:
+
+```{r preprocess pca, cache=TRUE}
+
+pca_train <- preProcess(x = traindata[,-53], method = c("pca"))
+pca_traindata <- predict(pca_train, traindata)
+
+pca_testdata <- predict(pca_train, testdata)
+
+set.seed(2343)
+
+model_pca <- randomForest(x = pca_traindata[,-1], y = as.factor(pca_traindata$classe), importance = TRUE)
+
+confusionMatrix(pca_testdata$classe, predict(model_pca, pca_testdata))$overall["Accuracy"]
+
+```
+
+Randomforest model of traindata after decreasing number of predictors in traindata by removing highly correlating predictors:
+
+```{r preprocess correlation, cache=TRUE}
+
+correlationMatrix <- cor(traindata[,-53])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.8)
+cor_traindata <- traindata[,-highlyCorrelated]
+cor_testdata <- testdata[, -highlyCorrelated]
+
+set.seed(2343)
+
+model_corr <- randomForest(x = cor_traindata[,-39], y = as.factor(cor_traindata$classe), importance = TRUE)
+
+confusionMatrix(cor_testdata$classe, predict(model_corr, cor_testdata))$overall["Accuracy"]
+```
+
+Training randomforest model of traindata with cross validation (unfortunately computing times were very long when cross validation was used so I was not able to use higher values for number variable or use other methods for cross validation):
+
+```{r rf with cross validation, cache=TRUE}
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+set.seed(2343)
+
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+
+model_rf2 <- train(x = traindata[ ,-53],y = as.factor(traindata[ ,53]), method="rf",
+                  trControl = fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+confusionMatrix(testdata$classe, predict(model_rf2, testdata))$overall["Accuracy"]
+```
+
+Randomforest model of traindata after scaling and centering predictors in traindata:
+
+```{r preprocess scale and center, cache=TRUE}
+
+pre_traindata <- preProcess(x = traindata[,-53], method = c("scale", "center"))
+pre_train <- predict(pre_traindata, traindata)
+pre_testdata <- preProcess(x = testdata[,-53], method = c("scale", "center"))
+pre_test <- predict(pre_testdata, testdata)
+set.seed(2343)
+
+model_pre <- randomForest(x = pre_train[,-53], y = as.factor(pre_train$classe), ntree = 500, importance = TRUE)
+
+confusionMatrix(pre_test$classe, predict(model_pre, pre_test))$overall["Accuracy"]
+
+```
+
+## Final model
+
+
+Highest accuracy in predicting classes in testdata was obtained with randomforest model (model_rf) without preprocessing of the data or without cross validation. Accuracy with that model was 0.9925.
+
+```{r model_rf}
+model_rf
+```
+
+
+```{r out of sample error}
+
+preds <- predict(model_rf, testdata)
+correct_preds <- sum(preds == testdata$classe)/length(preds)
+outofsampleerror <- round((1 - correct_preds)*100, 2)
+paste("Out of sample error estimate of model_rf is", outofsampleerror ,"%")
+```
+
+### Model_rf predictions of testing dataset:
+
+```{r predictions of testing dataset}
+testing <- testing[,-removed_cols]
+predictions <- predict(model_rf, newdata = testing)
+predictions
+```
+
+
+
+
+
+
